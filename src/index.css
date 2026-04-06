@@ -1,0 +1,60 @@
+:root {
+  color-scheme: dark;
+  font-family:
+    'Aptos',
+    'Segoe UI Variable Text',
+    'IBM Plex Sans',
+    'Segoe UI',
+    sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color: #eef3f8;
+  background:
+    radial-gradient(circle at top, rgba(28, 61, 92, 0.75), rgba(5, 10, 18, 0.94) 46%),
+    #07111c;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  --text-strong: #f5f8fb;
+  --soft: #9eb5c7;
+  --muted: #7f91a1;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100vh;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+}
+
+h1,
+h2,
+h3,
+strong {
+  font-family:
+    'Aptos Display',
+    'Segoe UI Variable Display',
+    'Bahnschrift',
+    'Trebuchet MS',
+    sans-serif;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+a {
+  color: inherit;
+}
