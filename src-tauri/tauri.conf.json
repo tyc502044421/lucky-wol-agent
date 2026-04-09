@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Lucky WOL Agent",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "identifier": "com.tyc.lucky-wol-agent",
   "build": {
     "frontendDist": "../dist",
