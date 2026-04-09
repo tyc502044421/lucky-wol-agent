@@ -96,7 +96,7 @@ npm run tauri:build
 
 本项目是 **受控端（Agent）**，不包含主控端功能。使用前需要先在 Lucky 中配置「网络唤醒」功能并获取对应的主控地址和 Token。
 
-- Lucky 官网：https://lucky.sirling.com
+- Lucky 官网：https://lucky666.cn/
 
 ---
 
