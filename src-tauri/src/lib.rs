@@ -16,6 +16,7 @@ use ecb::{Decryptor, Encryptor};
 use futures_util::{SinkExt, StreamExt};
 use hostname::get as get_hostname;
 use mac_address::get_mac_address;
+use network_interface::{NetworkInterface, NetworkInterfaceConfig};
 use native_tls::TlsConnector as NativeTlsConnector;
 use serde::{Deserialize, Serialize};
 use tauri::{
@@ -33,6 +34,15 @@ use tokio_tungstenite::{
   Connector,
 };
 use uuid::Uuid;
+
+/// 单张网卡的基本信息，供前端选择用
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkInterfaceInfo {
+  name: String,
+  mac: String,
+  ip: Option<String>,
+}
 
 const CONFIG_FOLDER: &str = "LuckyWOLAgent";
 const CONFIG_FILE: &str = "agent-config.json";
@@ -368,6 +378,30 @@ impl SharedState {
     });
     self.push_event(EventLevel::Info, "连接器已停止", detail);
   }
+}
+
+/// 枚举当前设备所有拥有 MAC 地址的网络接口，返回列表供前端选择
+/// 自动过滤蓝牙接口和全零 MAC
+#[tauri::command]
+fn get_network_interfaces() -> Vec<NetworkInterfaceInfo> {
+  NetworkInterface::show()
+    .unwrap_or_default()
+    .into_iter()
+    .filter(|iface| {
+      let lower = iface.name.to_lowercase();
+      !lower.contains("bluetooth") && !lower.contains("蓝牙")
+    })
+    .filter_map(|iface| {
+      iface.mac_addr.map(|mac| {
+        let ip = iface.addr.iter().find_map(|addr| match addr {
+          network_interface::Addr::V4(v4) => Some(v4.ip.to_string()),
+          _ => None,
+        });
+        NetworkInterfaceInfo { name: iface.name, mac, ip }
+      })
+    })
+    .filter(|iface| iface.mac != "00:00:00:00:00:00")
+    .collect()
 }
 
 #[tauri::command]
@@ -1564,6 +1598,7 @@ pub fn run() {
     })
     .invoke_handler(tauri::generate_handler![
       get_bootstrap,
+      get_network_interfaces,
       save_config,
       connect_now,
       reconnect_now,

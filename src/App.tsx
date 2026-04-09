@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
@@ -6,15 +6,18 @@ import {
   Cable,
   CheckCircle2,
   Cpu,
+  Eye,
+  EyeOff,
   HardDriveDownload,
   House,
   LaptopMinimal,
   LoaderCircle,
+  Network,
   Power,
   RadioTower,
   RefreshCcw,
   Save,
-  ServerCog,
+  Settings,
   ShieldCheck,
   Sparkles,
   TimerReset,
@@ -31,6 +34,12 @@ type Toast = {
   id: string
   level: ToastLevel
   message: string
+}
+
+type NetworkInterfaceInfo = {
+  name: string
+  mac: string
+  ip: string | null
 }
 
 type AppConfig = {
@@ -127,6 +136,21 @@ const text = {
   cancelAction: '取消执行',
   executeAction: '立即执行',
   seconds: '秒',
+  macLabel: 'MAC 地址',
+  macDesc: '本机网卡 MAC 地址，Wake on LAN 功能必须填写。',
+  macPickerTitle: '选择网卡',
+  macPickerDesc: '以下为当前设备检测到的所有网卡，点击选择对应 MAC 地址。',
+  macPickerEmpty: '未检测到可用网卡',
+  macPickerLoading: '正在读取网卡列表…',
+  macPickerCancel: '取消',
+  settingsTitle: '连接 Token 设置',
+  settingsDesc: '请设置连接 Token，确认后需要点击「保存配置」才会生效。',
+  settingsTokenLabel: '连接 Token',
+  settingsTokenDesc: '需要与 Lucky 主控端中的连接 Token 保持一致。',
+  settingsTokenShow: '显示',
+  settingsTokenHide: '隐藏',
+  settingsConfirm: '确认',
+  settingsCancel: '取消',
 }
 
 const emptyBootstrap: BootstrapPayload = {
@@ -180,6 +204,12 @@ function App() {
   const [saving, setSaving] = useState(false)
   const [busyAction, setBusyAction] = useState<string | null>(null)
   const [toasts, setToasts] = useState<Toast[]>([])
+  const [showMacPicker, setShowMacPicker] = useState(false)
+  const [macInterfaces, setMacInterfaces] = useState<NetworkInterfaceInfo[]>([])
+  const [macPickerLoading, setMacPickerLoading] = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
+  const [settingsToken, setSettingsToken] = useState('')
+  const [showSettingsToken, setShowSettingsToken] = useState(false)
   const [pendingShutdown, setPendingShutdown] = useState<ShutdownPromptPayload | null>(null)
   const [countdownNow, setCountdownNow] = useState(() => Date.now())
   const toastCounterRef = useRef(0)
@@ -195,6 +225,36 @@ function App() {
   const dismissToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id))
   }, [])
+
+  const openMacPicker = async () => {
+    setShowMacPicker(true)
+    setMacPickerLoading(true)
+    try {
+      const list = await invoke<NetworkInterfaceInfo[]>('get_network_interfaces')
+      setMacInterfaces(list)
+    } catch (error) {
+      addToast('error', String(error))
+      setShowMacPicker(false)
+    } finally {
+      setMacPickerLoading(false)
+    }
+  }
+
+  const selectMac = (mac: string) => {
+    updateDraft('mac', mac)
+    setShowMacPicker(false)
+  }
+
+  const openSettings = () => {
+    setSettingsToken(draft.token)
+    setShowSettingsToken(false)
+    setShowSettings(true)
+  }
+
+  const applySettings = () => {
+    updateDraft('token', settingsToken)
+    setShowSettings(false)
+  }
 
   const loadBootstrap = async () => {
     const payload = await invoke<BootstrapPayload>('get_bootstrap')
@@ -244,13 +304,6 @@ function App() {
   const dirty = JSON.stringify(draft) !== JSON.stringify(bootstrap.config)
   const shutdownSecondsLeft = pendingShutdown ? Math.max(0, Math.ceil((pendingShutdown.deadlineUnixMs - countdownNow) / 1000)) : 0
 
-  const runtimeHints = useMemo(
-    () => [
-      { label: text.autoConnect, value: draft.autoConnect ? text.enabled : text.manual, icon: RadioTower },
-      { label: text.tray, value: draft.minimizeToTray ? text.enabled : text.disabled, icon: House },
-    ],
-    [draft.autoConnect, draft.minimizeToTray],
-  )
 
   const executionActionLabel =
     bootstrap.config.executionAction === 'hibernate'
@@ -423,15 +476,23 @@ function App() {
       </header>
 
       <section className="control-strip">
-        {runtimeHints.map(({ icon: Icon, label, value }) => (
-          <article className="metric-card" key={label}>
-            <Icon size={15} />
+        <article className="metric-card metric-card--merged">
+          <div className="metric-card__item">
+            <RadioTower size={15} />
             <div>
-              <span>{label}</span>
-              <strong>{value}</strong>
+              <span>{text.autoConnect}</span>
+              <strong>{draft.autoConnect ? text.enabled : text.manual}</strong>
             </div>
-          </article>
-        ))}
+          </div>
+          <div className="metric-card__divider" />
+          <div className="metric-card__item">
+            <House size={15} />
+            <div>
+              <span>{text.tray}</span>
+              <strong>{draft.minimizeToTray ? text.enabled : text.disabled}</strong>
+            </div>
+          </div>
+        </article>
 
         <label className="select-card">
           <div className="select-card__meta">
@@ -460,13 +521,21 @@ function App() {
             <span />
           </span>
         </button>
+
+        <button
+          className="control-strip__settings-btn"
+          onClick={openSettings}
+          title={text.settingsTitle}
+          type="button"
+        >
+          <Settings size={16} />
+        </button>
       </section>
 
       <section className="workspace-grid workspace-grid--compact">
         <section className="panel form-card form-card--merged">
           <div className="panel-head">
             <span>{text.mergedCard}</span>
-            <ServerCog size={15} />
           </div>
 
           <div className="merged-form-grid">
@@ -476,17 +545,42 @@ function App() {
             <LabeledField label={text.deviceNameLabel} description={text.deviceNameDesc}>
               <input value={draft.deviceName} onChange={(event) => updateDraft('deviceName', event.target.value)} placeholder="办公电脑" />
             </LabeledField>
-            <LabeledField label={text.tokenLabel} description={text.tokenDesc}>
-              <input value={draft.token} onChange={(event) => updateDraft('token', event.target.value)} placeholder="请输入 Token" />
-            </LabeledField>
             <LabeledField label={text.broadcastLabel} description={text.broadcastDesc}>
               <input value={draft.broadcastIp} onChange={(event) => updateDraft('broadcastIp', event.target.value)} placeholder="192.168.1.255" />
+            </LabeledField>
+            <LabeledField label={text.macLabel} description={text.macDesc}>
+              <div className="field-with-action">
+                <input value={draft.mac} onChange={(event) => updateDraft('mac', event.target.value)} placeholder="AA:BB:CC:DD:EE:FF" />
+                <button className="field-action-btn" onClick={openMacPicker} type="button" title="从网卡列表中选择">
+                  <Network size={14} />
+                </button>
+              </div>
             </LabeledField>
           </div>
         </section>
       </section>
 
       <ToastContainer toasts={toasts} onDismiss={dismissToast} />
+
+      {showMacPicker && (
+        <MacPickerDialog
+          loading={macPickerLoading}
+          interfaces={macInterfaces}
+          onSelect={selectMac}
+          onClose={() => setShowMacPicker(false)}
+        />
+      )}
+
+      {showSettings && (
+        <SettingsDialog
+          token={settingsToken}
+          showToken={showSettingsToken}
+          onTokenChange={setSettingsToken}
+          onToggleShowToken={() => setShowSettingsToken((v) => !v)}
+          onConfirm={applySettings}
+          onClose={() => setShowSettings(false)}
+        />
+      )}
 
       {pendingShutdown ? (
         <div className="shutdown-overlay">
@@ -533,6 +627,105 @@ function LabeledField({ label, description, children }: LabeledFieldProps) {
       </span>
       {children}
     </label>
+  )
+}
+
+type SettingsDialogProps = {
+  token: string
+  showToken: boolean
+  onTokenChange: (value: string) => void
+  onToggleShowToken: () => void
+  onConfirm: () => void
+  onClose: () => void
+}
+
+function SettingsDialog({ token, showToken, onTokenChange, onToggleShowToken, onConfirm, onClose }: SettingsDialogProps) {
+  return (
+    <div className="settings-overlay" onClick={onClose}>
+      <div className="settings-dialog" onClick={(e) => e.stopPropagation()}>
+        <div className="settings-dialog__head">
+          <div className="settings-dialog__title">
+            <Settings size={15} />
+            <span>{text.settingsTitle}</span>
+          </div>
+          <button className="mac-picker-dialog__close" onClick={onClose} aria-label="关闭">✕</button>
+        </div>
+        <p className="settings-dialog__desc">{text.settingsDesc}</p>
+
+        <label className="field">
+          <span className="field__meta">
+            <strong>{text.settingsTokenLabel}</strong>
+            <small>{text.settingsTokenDesc}</small>
+          </span>
+          <div className="field-with-action">
+            <input
+              type={showToken ? 'text' : 'password'}
+              value={token}
+              onChange={(e) => onTokenChange(e.target.value)}
+              placeholder="请输入 Token"
+              autoComplete="off"
+            />
+            <button className="field-action-btn" onClick={onToggleShowToken} type="button" title={showToken ? text.settingsTokenHide : text.settingsTokenShow}>
+              {showToken ? <EyeOff size={14} /> : <Eye size={14} />}
+            </button>
+          </div>
+        </label>
+
+        <div className="settings-dialog__footer">
+          <button className="button button--ghost" onClick={onClose}>{text.settingsCancel}</button>
+          <button className="button button--primary" onClick={onConfirm}>{text.settingsConfirm}</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+type MacPickerDialogProps = {
+  loading: boolean
+  interfaces: NetworkInterfaceInfo[]
+  onSelect: (mac: string) => void
+  onClose: () => void
+}
+
+function MacPickerDialog({ loading, interfaces, onSelect, onClose }: MacPickerDialogProps) {
+  return (
+    <div className="mac-picker-overlay" onClick={onClose}>
+      <div className="mac-picker-dialog" onClick={(e) => e.stopPropagation()}>
+        <div className="mac-picker-dialog__head">
+          <div className="mac-picker-dialog__title">
+            <Network size={15} />
+            <span>{text.macPickerTitle}</span>
+          </div>
+          <button className="mac-picker-dialog__close" onClick={onClose} aria-label="关闭">✕</button>
+        </div>
+        <p className="mac-picker-dialog__desc">{text.macPickerDesc}</p>
+        <div className="mac-picker-list">
+          {loading ? (
+            <div className="mac-picker-empty">
+              <LoaderCircle size={18} className="spin" />
+              <span>{text.macPickerLoading}</span>
+            </div>
+          ) : interfaces.length === 0 ? (
+            <div className="mac-picker-empty">
+              <span>{text.macPickerEmpty}</span>
+            </div>
+          ) : (
+            interfaces.map((iface) => (
+              <button key={iface.mac} className="mac-picker-item" onClick={() => onSelect(iface.mac)} type="button">
+                <span className="mac-picker-item__name">
+                  {iface.name}
+                  {iface.ip && <span className="mac-picker-item__ip">{iface.ip}</span>}
+                </span>
+                <span className="mac-picker-item__mac">{iface.mac}</span>
+              </button>
+            ))
+          )}
+        </div>
+        <div className="mac-picker-dialog__footer">
+          <button className="button button--ghost" onClick={onClose}>{text.macPickerCancel}</button>
+        </div>
+      </div>
+    </div>
   )
 }
 
