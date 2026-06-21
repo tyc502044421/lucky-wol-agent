@@ -356,15 +356,18 @@ impl SharedState {
   }
 
   fn start_connector(&self) {
+    log::info!("start_connector: aborting existing task and starting new connector");
     self.abort_task();
     let runtime = self.clone();
     let handle = tauri::async_runtime::spawn(async move {
       run_connector_v2(runtime).await;
     });
     *self.task.lock().expect("task lock poisoned") = Some(handle);
+    log::info!("start_connector: new connector task spawned");
   }
 
   fn stop_connector(&self, detail: &str) {
+    log::info!("stop_connector: stopping connector, reason={}", detail);
     self.abort_task();
     self.clear_shutdown_prompt();
     self.set_connection(ConnectionSnapshot {
@@ -429,11 +432,19 @@ fn save_config(state: State<'_, SharedState>, config: AppConfig) -> Result<Boots
   next.power_off_cmd = power_command_for_action(&next.execution_action);
   next.update_time = unix_now();
 
+  log::info!("save_config: host={:?}, deviceName={:?}, mac={:?}, autoConnect={}",
+    next.host, next.device_name, next.mac, next.auto_connect);
+
   state.set_config(next.clone())?;
+  log::info!("save_config: config persisted successfully");
   state.push_event(EventLevel::Success, "配置已保存", "新的运行配置已经写入本地。");
 
   if next.auto_connect && !next.host.is_empty() && !next.token.is_empty() {
+    log::info!("save_config: autoConnect enabled, starting connector");
     state.start_connector();
+  } else {
+    log::info!("save_config: not starting connector (autoConnect={}, host empty={}, token empty={})",
+      next.auto_connect, next.host.is_empty(), next.token.is_empty());
   }
 
   Ok(state.bootstrap_payload())
@@ -443,9 +454,11 @@ fn save_config(state: State<'_, SharedState>, config: AppConfig) -> Result<Boots
 fn connect_now(state: State<'_, SharedState>) -> Result<(), String> {
   let config = state.config_snapshot();
   if config.host.is_empty() || config.token.is_empty() {
+    log::warn!("connect_now: rejected - host or token empty");
     return Err("请先填写主控地址和 Token。".into());
   }
 
+  log::info!("connect_now: manual connect triggered");
   state.push_event(EventLevel::Info, "手动连接", "正在立即发起主控连接。");
   state.start_connector();
   Ok(())
@@ -453,12 +466,14 @@ fn connect_now(state: State<'_, SharedState>) -> Result<(), String> {
 
 #[tauri::command]
 fn reconnect_now(state: State<'_, SharedState>) {
+  log::info!("reconnect_now: reconnection triggered by user");
   state.push_event(EventLevel::Info, "请求重连", "正在刷新与主控端的连接。");
   state.start_connector();
 }
 
 #[tauri::command]
 fn disconnect_now(state: State<'_, SharedState>) {
+  log::info!("disconnect_now: disconnection triggered by user");
   state.stop_connector("Stopped by user");
 }
 
@@ -498,6 +513,7 @@ fn set_launch_at_startup(app: AppHandle, state: State<'_, SharedState>, enabled:
 
 async fn run_connector(state: SharedState) {
   let mut attempts = 0u32;
+  let mut time_offset = 0i64;
 
   loop {
     let config = state.config_snapshot();
@@ -550,7 +566,7 @@ async fn run_connector(state: SharedState) {
         state.push_event(EventLevel::Success, "WebSocket 已连接", format!("已连接到 {connect_target}，等待 Lucky 登录响应。"));
         let (mut write, mut read) = stream.split();
 
-        match create_login_message(&config) {
+        match create_login_message(&config, time_offset) {
           Ok(payload) => {
             state.push_event(
               EventLevel::Info,
@@ -626,6 +642,10 @@ async fn run_connector(state: SharedState) {
                   });
                   state.push_event(EventLevel::Success, "鉴权成功", "Lucky 主控端已接受当前设备。");
                 } else {
+                  if response.msg.contains("TimeDifference") {
+                    time_offset = unix_now() - response.system_now_time;
+                    log::info!("run_connector: detected time offset {}s", time_offset);
+                  }
                   state.set_connection(ConnectionSnapshot {
                     phase: ConnectionPhase::Error,
                     connected: false,
@@ -765,39 +785,124 @@ async fn run_connector(state: SharedState) {
 }
 
 async fn resolve_websocket_endpoint(endpoint: &str, config: &AppConfig) -> Result<String, String> {
+  log::info!("resolve_websocket_endpoint: testing endpoint={}", endpoint);
   match connect_with_config(config, endpoint).await {
     Ok((stream, _)) => {
+      log::info!("resolve_websocket_endpoint: direct connect OK, endpoint={}", endpoint);
       drop(stream);
       Ok(endpoint.to_string())
     }
     Err(tungstenite::Error::Http(response)) => {
       let status = response.status();
+      log::warn!("resolve_websocket_endpoint: got HTTP {}, status_code={}", if matches!(status.as_u16(), 301 | 302 | 307 | 308) { "redirect" } else { "error" }, status);
       if !matches!(status.as_u16(), 301 | 302 | 307 | 308) {
-        return Err(format!("HTTP error: {status}"));
+        let body = response.body().as_ref().map(|b| String::from_utf8_lossy(b)[..256.min(b.len())].to_string()).unwrap_or_default();
+      log::error!("resolve_websocket_endpoint: non-redirect HTTP response: status={}, body={}", status, body);
+      return Err(format!("HTTP error: {status}"));
       }
 
       let Some(location) = response.headers().get("location") else {
+        log::error!("resolve_websocket_endpoint: HTTP {} but no Location header", status);
         return Err(format!("HTTP error: {status}，但响应里没有 Location"));
       };
 
       let location = location
         .to_str()
-        .map_err(|error| format!("跳转地址解析失败: {error}"))?;
+        .map_err(|error| {
+          log::error!("resolve_websocket_endpoint: Location header parse failed: {}", error);
+          format!("跳转地址解析失败: {error}")
+        })?;
 
-      Ok(normalize_redirect_target(endpoint, location))
+      let redirect = normalize_redirect_target(endpoint, location);
+      log::info!("resolve_websocket_endpoint: following redirect from {} to {}", endpoint, redirect);
+      Ok(redirect)
     }
-    Err(error) => Err(error.to_string()),
+    Err(error) => {
+      let desc = describe_ws_error(&error, endpoint);
+      log::error!("resolve_websocket_endpoint: {} -> {}", endpoint, desc);
+      Err(desc)
+    }
+  }
+}
+
+fn describe_ws_error(error: &tungstenite::Error, endpoint: &str) -> String {
+  match error {
+    tungstenite::Error::Io(io_err) => {
+      let kind = io_err.kind();
+      let msg = io_err.to_string();
+      log::error!("WS I/O error: kind={:?}, detail={}, endpoint={}", kind, msg, endpoint);
+      match kind {
+        std::io::ErrorKind::ConnectionRefused => format!("连接被拒绝: {msg}"),
+        std::io::ErrorKind::ConnectionAborted => format!("连接被中止: {msg}"),
+        std::io::ErrorKind::ConnectionReset => format!("连接被重置: {msg}"),
+        std::io::ErrorKind::TimedOut => format!("连接超时: {msg}"),
+        std::io::ErrorKind::HostUnreachable => format!("主机不可达: {msg}"),
+        std::io::ErrorKind::AddrNotAvailable => format!("地址不可用: {msg}"),
+        std::io::ErrorKind::NotFound => format!("DNS 解析失败: {msg}"),
+        std::io::ErrorKind::InvalidInput => format!("无效的地址格式: {msg}"),
+        _ => format!("网络错误 (kind={kind:?}): {msg}"),
+      }
+    }
+    tungstenite::Error::Tls(tls_err) => {
+      let msg = tls_err.to_string();
+      log::error!("TLS error: {}, endpoint={}", msg, endpoint);
+      if msg.contains("certificate") || msg.contains("cert") {
+        format!("TLS 证书错误: {msg}（尝试开启「跳过证书验证」）")
+      } else {
+        format!("TLS 握手失败: {msg}")
+      }
+    }
+    tungstenite::Error::Protocol(proto_err) => {
+      let msg = proto_err.to_string();
+      log::error!("WS protocol error: {}, endpoint={}", msg, endpoint);
+      format!("WebSocket 协议错误: {msg}")
+    }
+    tungstenite::Error::Http(response) => {
+      let status = response.status();
+      let body = response.body().as_ref().map(|b| String::from_utf8_lossy(b)[..256.min(b.len())].to_string()).unwrap_or_default();
+      log::error!("WS HTTP error: status={}, body={}, endpoint={}", status, body, endpoint);
+      format!("WebSocket 握手失败, HTTP {status}: {body}")
+    }
+    tungstenite::Error::Utf8(_) => {
+      log::error!("WS UTF-8 error, endpoint={}", endpoint);
+      "WebSocket 数据编码错误 (UTF-8)".into()
+    }
+    tungstenite::Error::AttackAttempt => {
+      log::error!("WS attack attempt detected, endpoint={}", endpoint);
+      "WebSocket 安全检查失败".into()
+    }
+    tungstenite::Error::Capacity(_) => {
+      log::error!("WS capacity error, endpoint={}", endpoint);
+      "WebSocket 内部缓冲区溢出".into()
+    }
+    tungstenite::Error::WriteBufferFull(_) => {
+      log::error!("WS write buffer full, endpoint={}", endpoint);
+      "WebSocket 写缓冲区已满".into()
+    }
+    tungstenite::Error::Url(_) => {
+      log::error!("WS URL parse error, endpoint={}", endpoint);
+      "WebSocket 地址格式错误".into()
+    }
+    _ => {
+      let msg = error.to_string();
+      log::error!("WS unknown error: {}, endpoint={}", msg, endpoint);
+      msg
+    }
   }
 }
 
 async fn run_connector_v2(state: SharedState) {
   let mut attempts = 0u32;
+  let mut time_offset = 0i64;
+
+  log::info!("run_connector_v2: connector started");
 
   loop {
     let config = state.config_snapshot();
     let endpoint = normalize_ws_url(&config.host);
 
     if config.host.is_empty() || config.token.is_empty() {
+      log::warn!("run_connector_v2: host or token empty, returning to idle");
       state.set_connection(ConnectionSnapshot {
         phase: ConnectionPhase::Idle,
         connected: false,
@@ -811,6 +916,8 @@ async fn run_connector_v2(state: SharedState) {
     }
 
     attempts = attempts.saturating_add(1);
+    log::info!("run_connector_v2: attempt #{} endpoint={}", attempts, endpoint);
+
     state.set_connection(ConnectionSnapshot {
       phase: if attempts == 1 {
         ConnectionPhase::Connecting
@@ -825,26 +932,35 @@ async fn run_connector_v2(state: SharedState) {
       last_event_at: state.connection_snapshot().last_event_at,
     });
 
+    log::info!("run_connector_v2: attempt #{}, resolving endpoint {}", attempts, endpoint);
     let connect_target = match resolve_websocket_endpoint(&endpoint, &config).await {
-      Ok(target) => target,
+      Ok(target) => {
+        log::info!("run_connector_v2: endpoint resolved to {}", target);
+        target
+      }
       Err(error) => {
+        log::error!("run_connector_v2: endpoint resolution failed for {}: {}", endpoint, error);
         state.set_connection(ConnectionSnapshot {
           phase: ConnectionPhase::Error,
           connected: false,
-          detail: "无法连接到主控端".into(),
+          detail: error.clone(),
           endpoint: endpoint.clone(),
           attempts,
           last_error: Some(error.clone()),
           last_event_at: state.connection_snapshot().last_event_at,
         });
         state.push_event(EventLevel::Error, "连接失败", error);
+        log::info!("run_connector_v2: waiting 3s before retry #{}", attempts);
         sleep(Duration::from_secs(3)).await;
         continue;
       }
     };
 
+    log::info!("run_connector_v2: attempt #{}, connecting to {}", attempts, connect_target);
     match connect_with_config(&config, &connect_target).await {
-      Ok((stream, _)) => {
+      Ok((stream, response)) => {
+        let ws_protocol = response.headers().get("sec-websocket-protocol").and_then(|v| v.to_str().ok()).unwrap_or("(none)");
+        log::info!("run_connector_v2: WebSocket connected to {}, protocol={}", connect_target, ws_protocol);
         state.push_event(
           EventLevel::Success,
           "WebSocket 已连接",
@@ -852,9 +968,14 @@ async fn run_connector_v2(state: SharedState) {
         );
         let (mut write, mut read) = stream.split();
 
-        let payload = match create_login_message(&config) {
-          Ok(payload) => payload,
+        log::debug!("run_connector_v2: constructing Login message (timeOffset={})", time_offset);
+        let payload = match create_login_message(&config, time_offset) {
+          Ok(payload) => {
+            log::debug!("run_connector_v2: Login base64 payload length={}", payload.len());
+            payload
+          }
           Err(error) => {
+            log::error!("run_connector_v2: failed to construct Login message: {}", error);
             state.push_event(EventLevel::Error, "协议封包失败", error.clone());
             state.patch_connection(|snapshot| {
               snapshot.phase = ConnectionPhase::Error;
@@ -869,16 +990,20 @@ async fn run_connector_v2(state: SharedState) {
           }
         };
 
+        let now_ts = unix_now();
+        log::info!("run_connector_v2: sending Login (deviceKey={}, mac={}, relay={}, updateTime={})",
+          config.device_key, config.mac, config.relay, now_ts);
         state.push_event(
           EventLevel::Info,
           "准备发送 Login",
           format!(
             "deviceKey={} mac={} relay={} updateTime={}",
-            config.device_key, config.mac, config.relay, config.update_time
+            config.device_key, config.mac, config.relay, now_ts
           ),
         );
 
         if let Err(error) = write.send(Message::Text(payload.into())).await {
+          log::error!("run_connector_v2: failed to send Login: {}", error);
           state.patch_connection(|snapshot| {
             snapshot.phase = ConnectionPhase::Error;
             snapshot.connected = false;
@@ -892,6 +1017,7 @@ async fn run_connector_v2(state: SharedState) {
           continue;
         }
 
+        log::info!("run_connector_v2: Login sent, waiting for response (8s timeout)");
         state.push_event(EventLevel::Info, "Login 已发送", "已向 Lucky 主控端发送登录消息，等待响应。");
 
         let mut authenticated = false;
@@ -901,6 +1027,7 @@ async fn run_connector_v2(state: SharedState) {
           match message {
             Ok(Message::Text(text)) => {
               let preview: String = text.chars().take(96).collect();
+              log::info!("run_connector_v2: received text message, length={}, preview={}", text.len(), preview);
               state.push_event(
                 EventLevel::Info,
                 "收到入站文本消息",
@@ -909,6 +1036,7 @@ async fn run_connector_v2(state: SharedState) {
 
               match unpack_message(text.as_str(), &config.message_key) {
                 Ok(IncomingMessage::LoginResp(response)) => {
+                  log::info!("run_connector_v2: LoginResp received: ret={}, msg={:?}, systemNowTime={}", response.ret, response.msg, response.system_now_time);
                   state.push_event(
                     EventLevel::Info,
                     "收到 LoginResp",
@@ -919,6 +1047,7 @@ async fn run_connector_v2(state: SharedState) {
                   );
                   if response.ret == 0 {
                     authenticated = true;
+                    log::info!("run_connector_v2: authentication SUCCEEDED");
                     state.set_connection(ConnectionSnapshot {
                       phase: ConnectionPhase::Connected,
                       connected: true,
@@ -930,6 +1059,12 @@ async fn run_connector_v2(state: SharedState) {
                     });
                     state.push_event(EventLevel::Success, "鉴权成功", "Lucky 主控端已接受当前设备。");
                   } else {
+                    log::error!("run_connector_v2: authentication REJECTED by master: ret={}, msg={:?}", response.ret, response.msg);
+                    if response.msg.contains("TimeDifference") {
+                      let new_offset = unix_now() - response.system_now_time;
+                      log::info!("run_connector_v2: detected time offset {}s (client ahead), will compensate", new_offset);
+                      time_offset = new_offset;
+                    }
                     state.set_connection(ConnectionSnapshot {
                       phase: ConnectionPhase::Error,
                       connected: false,
@@ -944,6 +1079,8 @@ async fn run_connector_v2(state: SharedState) {
                   }
                 }
                 Ok(IncomingMessage::SyncClientConfigure(sync)) => {
+                  log::info!("run_connector_v2: SyncClientConfigure: deviceName={}, mac={}, broadcastIp={}, updateTime={}",
+                    sync.device_name, sync.mac, sync.broadcast_ip, sync.update_time);
                   state.push_event(
                     EventLevel::Info,
                     "收到配置同步",
@@ -952,6 +1089,7 @@ async fn run_connector_v2(state: SharedState) {
                   let mut next = state.config_snapshot();
                   next.auto_connect = sync.enable;
                   if !sync.server_url.trim().is_empty() {
+                    log::info!("run_connector_v2:  updating host from sync: {}", sync.server_url);
                     next.host = sync.server_url;
                   }
                   next.skip_cert_verification = sync.insecure_skip_verify;
@@ -960,6 +1098,7 @@ async fn run_connector_v2(state: SharedState) {
                   }
                   next.relay = sync.relay;
                   if !sync.key.trim().is_empty() {
+                    log::info!("run_connector_v2:  updating deviceKey from sync: {}", sync.key);
                     next.device_key = sync.key;
                   }
                   if !sync.device_name.trim().is_empty() {
@@ -979,16 +1118,22 @@ async fn run_connector_v2(state: SharedState) {
                   next.update_time = sync.update_time;
 
                   if let Err(error) = state.set_config(next) {
+                    log::warn!("run_connector_v2: failed to persist synced config: {}", error);
                     state.push_event(EventLevel::Warning, "配置同步警告", error);
                   } else {
+                    log::info!("run_connector_v2: config sync applied successfully");
                     state.push_event(EventLevel::Info, "配置已同步", "主控端配置变更已应用到本地。");
                   }
                 }
-                Ok(IncomingMessage::ReplyWakeUp(payload)) => match relay_magic_packets(payload) {
-                  Ok(()) => state.push_event(EventLevel::Success, "已发送唤醒中继", "魔术包已经在当前局域网内广播。"),
-                  Err(error) => state.push_event(EventLevel::Error, "唤醒中继失败", error),
-                },
+                Ok(IncomingMessage::ReplyWakeUp(payload)) => {
+                  log::info!("run_connector_v2: ReplyWakeUp: macs={:?}, broadcastIPs={:?}, port={}", payload.mac_list, payload.broadcast_ips, payload.port);
+                  match relay_magic_packets(payload) {
+                    Ok(()) => state.push_event(EventLevel::Success, "已发送唤醒中继", "魔术包已经在当前局域网内广播。"),
+                    Err(error) => state.push_event(EventLevel::Error, "唤醒中继失败", error),
+                  }
+                }
                 Ok(IncomingMessage::ShutDown) => {
+                  log::warn!("run_connector_v2: ShutDown received, scheduling 30s countdown");
                   state.schedule_shutdown_prompt(30);
                   state.push_event(
                     EventLevel::Warning,
@@ -996,15 +1141,31 @@ async fn run_connector_v2(state: SharedState) {
                     "主控端请求 30 秒后关机，用户可以取消或立即执行。",
                   );
                 }
-                Err(error) => state.push_event(EventLevel::Warning, "入站消息解析失败", error),
+                Err(error) => {
+                  log::warn!("run_connector_v2: failed to parse incoming message: {}", error);
+                  state.push_event(EventLevel::Warning, "入站消息解析失败", error);
+                }
               }
             }
-            Ok(Message::Binary(_)) => {
+            Ok(Message::Binary(data)) => {
+              log::warn!("run_connector_v2: received unexpected binary frame, length={}", data.len());
               state.push_event(EventLevel::Warning, "收到不支持的帧", "当前实现期望接收文本帧，但收到了二进制帧。");
             }
-            Ok(Message::Close(_)) => break,
-            Ok(_) => {}
+            Ok(Message::Close(frame)) => {
+              log::info!("run_connector_v2: WebSocket close frame received: {:?}", frame);
+              break;
+            }
+            Ok(Message::Ping(_)) => {
+              log::debug!("run_connector_v2: received ping (auto-pong handled by tungstenite)");
+            }
+            Ok(Message::Pong(_)) => {
+              log::debug!("run_connector_v2: received pong");
+            }
+            Ok(Message::Frame(_)) => {
+              log::debug!("run_connector_v2: received raw frame (low-level)");
+            }
             Err(error) => {
+              log::error!("run_connector_v2: WebSocket read error: {}", error);
               state.set_connection(ConnectionSnapshot {
                 phase: ConnectionPhase::Error,
                 connected: false,
@@ -1020,6 +1181,7 @@ async fn run_connector_v2(state: SharedState) {
           }
 
           if !authenticated && tokio::time::Instant::now() > login_deadline {
+            log::warn!("run_connector_v2: Login response timeout (8s elapsed)");
             state.push_event(
               EventLevel::Warning,
               "登录响应超时",
@@ -1039,10 +1201,12 @@ async fn run_connector_v2(state: SharedState) {
         }
 
         if !authenticated {
+          log::info!("run_connector_v2: not authenticated, waiting 4s before retry");
           sleep(Duration::from_secs(4)).await;
           continue;
         }
 
+        log::info!("run_connector_v2: connection lost (authenticated session ended), will retry after 3s");
         state.set_connection(ConnectionSnapshot {
           phase: ConnectionPhase::Disconnected,
           connected: false,
@@ -1056,16 +1220,19 @@ async fn run_connector_v2(state: SharedState) {
         sleep(Duration::from_secs(3)).await;
       }
       Err(error) => {
+        let desc = describe_ws_error(&error, &connect_target);
+        log::error!("run_connector_v2: WebSocket connect error (attempt #{}): {}", attempts, desc);
         state.set_connection(ConnectionSnapshot {
           phase: ConnectionPhase::Error,
           connected: false,
-          detail: "无法连接到主控端".into(),
+          detail: desc.clone(),
           endpoint: connect_target.clone(),
           attempts,
           last_error: Some(error.to_string()),
           last_event_at: state.connection_snapshot().last_event_at,
         });
-        state.push_event(EventLevel::Error, "连接失败", error.to_string());
+        state.push_event(EventLevel::Error, "连接失败", desc);
+        log::info!("run_connector_v2: waiting 3s before retry #{}", attempts + 1);
         sleep(Duration::from_secs(3)).await;
       }
     }
@@ -1108,20 +1275,41 @@ async fn connect_with_config(
   ),
   tungstenite::Error,
 > {
+  log::info!("connect_with_config: attempting {} (skip_cert_verify={})", endpoint, config.skip_cert_verification);
+
   if endpoint.starts_with("wss://") {
     let mut builder = NativeTlsConnector::builder();
     if config.skip_cert_verification {
+      log::warn!("connect_with_config: TLS certificate verification DISABLED for {}", endpoint);
       builder.danger_accept_invalid_certs(true);
       builder.danger_accept_invalid_hostnames(true);
     }
     let connector = builder
       .build()
-      .map_err(|error| tungstenite::Error::Io(std::io::Error::other(error.to_string())))?;
+      .map_err(|error| {
+        log::error!("connect_with_config: TLS connector build failed: {}", error);
+        tungstenite::Error::Io(std::io::Error::other(error.to_string()))
+      })?;
     let connector = Connector::NativeTls(connector);
-    let request = endpoint.into_client_request()?;
-    connect_async_tls_with_config(request, None, false, Some(connector)).await
+    let request = endpoint.into_client_request().map_err(|error| {
+      log::error!("connect_with_config: invalid WS request URL '{}': {}", endpoint, error);
+      error
+    })?;
+    log::info!("connect_with_config: starting TLS WebSocket connection to {}", endpoint);
+    let result = connect_async_tls_with_config(request, None, false, Some(connector)).await;
+    match &result {
+      Ok(_) => log::info!("connect_with_config: TLS WebSocket connection OK to {}", endpoint),
+      Err(e) => log::error!("connect_with_config: TLS WebSocket connection FAILED to {}: {:?}", endpoint, e),
+    }
+    result
   } else {
-    connect_async(endpoint).await
+    log::info!("connect_with_config: starting plain WebSocket connection to {}", endpoint);
+    let result = connect_async(endpoint).await;
+    match &result {
+      Ok(_) => log::info!("connect_with_config: plain WebSocket connection OK to {}", endpoint),
+      Err(e) => log::error!("connect_with_config: plain WebSocket connection FAILED to {}: {:?}", endpoint, e),
+    }
+    result
   }
 }
 
@@ -1132,7 +1320,7 @@ enum IncomingMessage {
   ShutDown,
 }
 
-fn create_login_message(config: &AppConfig) -> Result<String, String> {
+fn create_login_message(config: &AppConfig, time_offset: i64) -> Result<String, String> {
   #[derive(Serialize)]
   struct LoginMessage<'a> {
     #[serde(rename = "Enable")]
@@ -1179,8 +1367,8 @@ fn create_login_message(config: &AppConfig) -> Result<String, String> {
     port: config.wol_port,
     repeat: config.wol_repeat,
     power_off_cmd: &config.power_off_cmd,
-    update_time: config.update_time,
-    client_time_stamp: unix_now(),
+    update_time: unix_now() - time_offset,
+    client_time_stamp: unix_now() - time_offset,
   };
 
   pack_message(b'0', &payload, &config.message_key)
@@ -1188,18 +1376,31 @@ fn create_login_message(config: &AppConfig) -> Result<String, String> {
 
 fn pack_message<T: Serialize>(message_type: u8, payload: &T, key: &str) -> Result<String, String> {
   let json = serde_json::to_vec(payload).map_err(|error| error.to_string())?;
+  log::debug!("pack_message: type={}, json_len={}", message_type as char, json.len());
   let mut buffer = Vec::with_capacity(json.len() + 9);
   buffer.push(message_type);
   buffer.extend_from_slice(&(json.len() as i64).to_be_bytes());
   buffer.extend_from_slice(&json);
-  Ok(BASE64.encode(encrypt_message(&buffer, key)?))
+  log::debug!("pack_message: plain frame len={} before encryption", buffer.len());
+  let encrypted = encrypt_message(&buffer, key)?;
+  log::debug!("pack_message: encrypted len={}", encrypted.len());
+  let encoded = BASE64.encode(&encrypted);
+  log::debug!("pack_message: base64 len={}", encoded.len());
+  Ok(encoded)
 }
 
 fn unpack_message(raw_text: &str, key: &str) -> Result<IncomingMessage, String> {
-  let encrypted = BASE64.decode(raw_text.as_bytes()).map_err(|error| error.to_string())?;
+  let encrypted = BASE64.decode(raw_text.as_bytes()).map_err(|error| {
+    log::warn!("unpack_message: base64 decode failed: {}", error);
+    error.to_string()
+  })?;
+  log::debug!("unpack_message: base64 decoded {} bytes", encrypted.len());
+
   let decrypted = decrypt_message(&encrypted, key)?;
+  log::debug!("unpack_message: decrypted {} bytes", decrypted.len());
 
   if decrypted.len() <= 9 {
+    log::warn!("unpack_message: decrypted frame too short ({} bytes)", decrypted.len());
     return Err("解密后的消息长度过短".into());
   }
 
@@ -1207,10 +1408,16 @@ fn unpack_message(raw_text: &str, key: &str) -> Result<IncomingMessage, String> 
   let payload_len =
     i64::from_be_bytes(decrypted[1..9].try_into().map_err(|_| "json length invalid".to_string())?);
   if payload_len < 0 {
+    log::warn!("unpack_message: negative json length: {}", payload_len);
     return Err("json length must not be negative".into());
   }
   let payload_len = payload_len as usize;
   if decrypted.len() < 9 + payload_len {
+    log::warn!(
+      "unpack_message: frame too short: declared json_len={}, actual_payload={}",
+      payload_len,
+      decrypted.len().saturating_sub(9)
+    );
     return Err(format!(
       "decrypted payload too short: declared json length {}, actual {}",
       payload_len,
@@ -1218,19 +1425,37 @@ fn unpack_message(raw_text: &str, key: &str) -> Result<IncomingMessage, String> 
     ));
   }
   let payload = &decrypted[9..9 + payload_len];
+  let payload_text = String::from_utf8_lossy(payload);
+  log::debug!("unpack_message: type={} (ascii={}), json_len={}, payload={}",
+    message_type, if message_type.is_ascii_graphic() { (message_type as char).to_string() } else { "?".into() }, payload_len, payload_text);
 
   match message_type {
     b'1' => serde_json::from_slice::<LoginResp>(payload)
       .map(IncomingMessage::LoginResp)
-      .map_err(|error| error.to_string()),
+      .map_err(|error| {
+        log::warn!("unpack_message: LoginResp JSON parse failed: {}", error);
+        error.to_string()
+      }),
     b'2' => serde_json::from_slice::<SyncClientConfigure>(payload)
       .map(IncomingMessage::SyncClientConfigure)
-      .map_err(|error| error.to_string()),
+      .map_err(|error| {
+        log::warn!("unpack_message: SyncClientConfigure JSON parse failed: {}", error);
+        error.to_string()
+      }),
     b'3' => serde_json::from_slice::<ReplyWakeUp>(payload)
       .map(IncomingMessage::ReplyWakeUp)
-      .map_err(|error| error.to_string()),
-    b'4' => Ok(IncomingMessage::ShutDown),
-    other => Err(format!("未知的 Lucky 消息类型: {other}")),
+      .map_err(|error| {
+        log::warn!("unpack_message: ReplyWakeUp JSON parse failed: {}", error);
+        error.to_string()
+      }),
+    b'4' => {
+      log::info!("unpack_message: received ShutDown (type=4)");
+      Ok(IncomingMessage::ShutDown)
+    }
+    other => {
+      log::warn!("unpack_message: unknown message type byte={} (ascii={})", other, if (other as char).is_ascii_graphic() { (other as char).to_string() } else { "?".into() });
+      Err(format!("未知的 Lucky 消息类型: {other}"))
+    }
   }
 }
 
@@ -1239,19 +1464,33 @@ fn encrypt_message(plain: &[u8], key: &str) -> Result<Vec<u8>, String> {
   let mut padded = plain.to_vec();
   let remainder = padded.len() % 8;
   if remainder != 0 {
-    padded.resize(padded.len() + (8 - remainder), 0);
+    let pad_len = 8 - remainder;
+    log::debug!("encrypt_message: padding {} zero bytes to align to 8", pad_len);
+    padded.resize(padded.len() + pad_len, 0);
   }
-  Ok(DesEncryptor::new((&normalized).into()).encrypt_padded_vec_mut::<NoPadding>(&padded))
+  log::debug!("encrypt_message: DES-ECB encrypting {} bytes with key={:?}", padded.len(), key);
+  let result = DesEncryptor::new((&normalized).into()).encrypt_padded_vec_mut::<NoPadding>(&padded);
+  log::debug!("encrypt_message: ciphertext {} bytes", result.len());
+  Ok(result)
 }
 
 fn decrypt_message(cipher_text: &[u8], key: &str) -> Result<Vec<u8>, String> {
   if cipher_text.len() % 8 != 0 {
+    log::warn!("decrypt_message: ciphertext length {} not aligned to 8", cipher_text.len());
     return Err("DES cipher text length must be aligned to 8 bytes".into());
   }
   let normalized = normalize_des_key(key);
-  DesDecryptor::new((&normalized).into())
-    .decrypt_padded_vec_mut::<NoPadding>(cipher_text)
-    .map_err(|error| error.to_string())
+  log::debug!("decrypt_message: DES-ECB decrypting {} bytes with key={:?}", cipher_text.len(), key);
+  match DesDecryptor::new((&normalized).into()).decrypt_padded_vec_mut::<NoPadding>(cipher_text) {
+    Ok(plain) => {
+      log::debug!("decrypt_message: decrypted {} bytes", plain.len());
+      Ok(plain)
+    }
+    Err(error) => {
+      log::warn!("decrypt_message: DES decrypt failed: {}", error);
+      Err(error.to_string())
+    }
+  }
 }
 
 fn normalize_des_key(raw: &str) -> [u8; 8] {
@@ -1562,7 +1801,7 @@ pub fn run() {
   tauri::Builder::default()
     .plugin(
       tauri_plugin_log::Builder::default()
-        .level(log::LevelFilter::Info)
+        .level(log::LevelFilter::Debug)
         .build(),
     )
     .plugin(tauri_plugin_autostart::init(
@@ -1570,7 +1809,12 @@ pub fn run() {
       None::<Vec<&str>>,
     ))
     .setup(|app| {
+      log::info!("Lucky WOL Agent v{} starting up", env!("CARGO_PKG_VERSION"));
+
       let config = load_config();
+      log::info!("config loaded: host={:?}, deviceKey={:?}, autoConnect={}, minimizeToTray={}, launchAtStartup={}",
+        config.host, config.device_key, config.auto_connect, config.minimize_to_tray, config.launch_at_startup);
+
       let state = SharedState::new(app.handle().clone(), config.clone());
       build_tray(app.handle(), &state)?;
       app.manage(state.clone());
@@ -1591,7 +1835,11 @@ pub fn run() {
       }
 
       if config.auto_connect && !config.host.is_empty() && !config.token.is_empty() {
+        log::info!("autoConnect enabled, starting connector to {}", config.host);
         state.start_connector();
+      } else {
+        let reason = if !config.auto_connect { "autoConnect disabled" } else if config.host.is_empty() { "host empty" } else { "token empty" };
+        log::info!("autoConnect skipped: {}", reason);
       }
 
       Ok(())
