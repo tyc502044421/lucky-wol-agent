@@ -1022,161 +1022,194 @@ async fn run_connector_v2(state: SharedState) {
 
         let mut authenticated = false;
         let login_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
 
-        while let Some(message) = read.next().await {
-          match message {
-            Ok(Message::Text(text)) => {
-              let preview: String = text.chars().take(96).collect();
-              log::info!("run_connector_v2: received text message, length={}, preview={}", text.len(), preview);
-              state.push_event(
-                EventLevel::Info,
-                "收到入站文本消息",
-                format!("长度={}，预览={}", text.len(), preview),
-              );
-
-              match unpack_message(text.as_str(), &config.message_key) {
-                Ok(IncomingMessage::LoginResp(response)) => {
-                  log::info!("run_connector_v2: LoginResp received: ret={}, msg={:?}, systemNowTime={}", response.ret, response.msg, response.system_now_time);
+        loop {
+          tokio::select! {
+            message = read.next() => {
+              match message {
+                Some(Ok(Message::Text(text))) => {
+                  let preview: String = text.chars().take(96).collect();
+                  log::info!("run_connector_v2: received text message, length={}, preview={}", text.len(), preview);
                   state.push_event(
                     EventLevel::Info,
-                    "收到 LoginResp",
-                    format!(
-                      "ret={} msg={} systemNowTime={}",
-                      response.ret, response.msg, response.system_now_time
-                    ),
+                    "收到入站文本消息",
+                    format!("长度={}，预览={}", text.len(), preview),
                   );
-                  if response.ret == 0 {
-                    authenticated = true;
-                    log::info!("run_connector_v2: authentication SUCCEEDED");
-                    state.set_connection(ConnectionSnapshot {
-                      phase: ConnectionPhase::Connected,
-                      connected: true,
-                      detail: "主控连接正常".into(),
-                      endpoint: connect_target.clone(),
-                      attempts,
-                      last_error: None,
-                      last_event_at: state.connection_snapshot().last_event_at,
-                    });
-                    state.push_event(EventLevel::Success, "鉴权成功", "Lucky 主控端已接受当前设备。");
-                  } else {
-                    log::error!("run_connector_v2: authentication REJECTED by master: ret={}, msg={:?}", response.ret, response.msg);
-                    if response.msg.contains("TimeDifference") {
-                      let new_offset = unix_now() - response.system_now_time;
-                      log::info!("run_connector_v2: detected time offset {}s (client ahead), will compensate", new_offset);
-                      time_offset = new_offset;
+
+                  match unpack_message(text.as_str(), &config.message_key) {
+                    Ok(IncomingMessage::LoginResp(response)) => {
+                      log::info!("run_connector_v2: LoginResp received: ret={}, msg={:?}, systemNowTime={}", response.ret, response.msg, response.system_now_time);
+                      state.push_event(
+                        EventLevel::Info,
+                        "收到 LoginResp",
+                        format!(
+                          "ret={} msg={} systemNowTime={}",
+                          response.ret, response.msg, response.system_now_time
+                        ),
+                      );
+                      if response.ret == 0 {
+                        authenticated = true;
+                        ping_interval.reset();
+                        log::info!("run_connector_v2: authentication SUCCEEDED");
+                        state.set_connection(ConnectionSnapshot {
+                          phase: ConnectionPhase::Connected,
+                          connected: true,
+                          detail: "主控连接正常".into(),
+                          endpoint: connect_target.clone(),
+                          attempts,
+                          last_error: None,
+                          last_event_at: state.connection_snapshot().last_event_at,
+                        });
+                        state.push_event(EventLevel::Success, "鉴权成功", "Lucky 主控端已接受当前设备。");
+                      } else {
+                        log::error!("run_connector_v2: authentication REJECTED by master: ret={}, msg={:?}", response.ret, response.msg);
+                        if response.msg.contains("TimeDifference") {
+                          let new_offset = unix_now() - response.system_now_time;
+                          log::info!("run_connector_v2: detected time offset {}s (client ahead), will compensate", new_offset);
+                          time_offset = new_offset;
+                        }
+                        state.set_connection(ConnectionSnapshot {
+                          phase: ConnectionPhase::Error,
+                          connected: false,
+                          detail: "主控端拒绝登录".into(),
+                          endpoint: connect_target.clone(),
+                          attempts,
+                          last_error: Some(response.msg.clone()),
+                          last_event_at: state.connection_snapshot().last_event_at,
+                        });
+                        state.push_event(EventLevel::Error, "登录被拒绝", response.msg);
+                        break;
+                      }
                     }
-                    state.set_connection(ConnectionSnapshot {
-                      phase: ConnectionPhase::Error,
-                      connected: false,
-                      detail: "主控端拒绝登录".into(),
-                      endpoint: connect_target.clone(),
-                      attempts,
-                      last_error: Some(response.msg.clone()),
-                      last_event_at: state.connection_snapshot().last_event_at,
-                    });
-                    state.push_event(EventLevel::Error, "登录被拒绝", response.msg);
-                    break;
-                  }
-                }
-                Ok(IncomingMessage::SyncClientConfigure(sync)) => {
-                  log::info!("run_connector_v2: SyncClientConfigure: deviceName={}, mac={}, broadcastIp={}, updateTime={}",
-                    sync.device_name, sync.mac, sync.broadcast_ip, sync.update_time);
-                  state.push_event(
-                    EventLevel::Info,
-                    "收到配置同步",
-                    format!("deviceName={} mac={} broadcastIp={}", sync.device_name, sync.mac, sync.broadcast_ip),
-                  );
-                  let mut next = state.config_snapshot();
-                  next.auto_connect = sync.enable;
-                  if !sync.server_url.trim().is_empty() {
-                    log::info!("run_connector_v2:  updating host from sync: {}", sync.server_url);
-                    next.host = sync.server_url;
-                  }
-                  next.skip_cert_verification = sync.insecure_skip_verify;
-                  if !sync.token.trim().is_empty() {
-                    next.token = sync.token;
-                  }
-                  next.relay = sync.relay;
-                  if !sync.key.trim().is_empty() {
-                    log::info!("run_connector_v2:  updating deviceKey from sync: {}", sync.key);
-                    next.device_key = sync.key;
-                  }
-                  if !sync.device_name.trim().is_empty() {
-                    next.device_name = sync.device_name;
-                  }
-                  if !sync.mac.trim().is_empty() {
-                    next.mac = sync.mac;
-                  }
-                  if !sync.broadcast_ip.trim().is_empty() {
-                    next.broadcast_ip = sync.broadcast_ip;
-                  }
-                  next.wol_port = sync.port;
-                  next.wol_repeat = sync.repeat;
-                  if !sync.power_off_cmd.trim().is_empty() {
-                    next.power_off_cmd = sync.power_off_cmd;
-                  }
-                  next.update_time = sync.update_time;
+                    Ok(IncomingMessage::SyncClientConfigure(sync)) => {
+                      log::info!("run_connector_v2: SyncClientConfigure: deviceName={}, mac={}, broadcastIp={}, updateTime={}",
+                        sync.device_name, sync.mac, sync.broadcast_ip, sync.update_time);
+                      state.push_event(
+                        EventLevel::Info,
+                        "收到配置同步",
+                        format!("deviceName={} mac={} broadcastIp={}", sync.device_name, sync.mac, sync.broadcast_ip),
+                      );
+                      let mut next = state.config_snapshot();
+                      next.auto_connect = sync.enable;
+                      if !sync.server_url.trim().is_empty() {
+                        log::info!("run_connector_v2:  updating host from sync: {}", sync.server_url);
+                        next.host = sync.server_url;
+                      }
+                      next.skip_cert_verification = sync.insecure_skip_verify;
+                      if !sync.token.trim().is_empty() {
+                        next.token = sync.token;
+                      }
+                      next.relay = sync.relay;
+                      if !sync.key.trim().is_empty() {
+                        log::info!("run_connector_v2:  updating deviceKey from sync: {}", sync.key);
+                        next.device_key = sync.key;
+                      }
+                      if !sync.device_name.trim().is_empty() {
+                        next.device_name = sync.device_name;
+                      }
+                      if !sync.mac.trim().is_empty() {
+                        next.mac = sync.mac;
+                      }
+                      if !sync.broadcast_ip.trim().is_empty() {
+                        next.broadcast_ip = sync.broadcast_ip;
+                      }
+                      next.wol_port = sync.port;
+                      next.wol_repeat = sync.repeat;
+                      if !sync.power_off_cmd.trim().is_empty() {
+                        next.power_off_cmd = sync.power_off_cmd;
+                      }
+                      next.update_time = sync.update_time;
 
-                  if let Err(error) = state.set_config(next) {
-                    log::warn!("run_connector_v2: failed to persist synced config: {}", error);
-                    state.push_event(EventLevel::Warning, "配置同步警告", error);
-                  } else {
-                    log::info!("run_connector_v2: config sync applied successfully");
-                    state.push_event(EventLevel::Info, "配置已同步", "主控端配置变更已应用到本地。");
+                      if let Err(error) = state.set_config(next) {
+                        log::warn!("run_connector_v2: failed to persist synced config: {}", error);
+                        state.push_event(EventLevel::Warning, "配置同步警告", error);
+                      } else {
+                        log::info!("run_connector_v2: config sync applied successfully");
+                        state.push_event(EventLevel::Info, "配置已同步", "主控端配置变更已应用到本地。");
+                      }
+                    }
+                    Ok(IncomingMessage::ReplyWakeUp(payload)) => {
+                      log::info!("run_connector_v2: ReplyWakeUp: macs={:?}, broadcastIPs={:?}, port={}", payload.mac_list, payload.broadcast_ips, payload.port);
+                      match relay_magic_packets(payload) {
+                        Ok(()) => state.push_event(EventLevel::Success, "已发送唤醒中继", "魔术包已经在当前局域网内广播。"),
+                        Err(error) => state.push_event(EventLevel::Error, "唤醒中继失败", error),
+                      }
+                    }
+                    Ok(IncomingMessage::ShutDown) => {
+                      log::warn!("run_connector_v2: ShutDown received, scheduling 30s countdown");
+                      state.schedule_shutdown_prompt(30);
+                      state.push_event(
+                        EventLevel::Warning,
+                        "收到关机指令",
+                        "主控端请求 30 秒后关机，用户可以取消或立即执行。",
+                      );
+                    }
+                    Err(error) => {
+                      log::warn!("run_connector_v2: failed to parse incoming message: {}", error);
+                      state.push_event(EventLevel::Warning, "入站消息解析失败", error);
+                    }
                   }
                 }
-                Ok(IncomingMessage::ReplyWakeUp(payload)) => {
-                  log::info!("run_connector_v2: ReplyWakeUp: macs={:?}, broadcastIPs={:?}, port={}", payload.mac_list, payload.broadcast_ips, payload.port);
-                  match relay_magic_packets(payload) {
-                    Ok(()) => state.push_event(EventLevel::Success, "已发送唤醒中继", "魔术包已经在当前局域网内广播。"),
-                    Err(error) => state.push_event(EventLevel::Error, "唤醒中继失败", error),
-                  }
+                Some(Ok(Message::Binary(data))) => {
+                  log::warn!("run_connector_v2: received unexpected binary frame, length={}", data.len());
+                  state.push_event(EventLevel::Warning, "收到不支持的帧", "当前实现期望接收文本帧，但收到了二进制帧。");
                 }
-                Ok(IncomingMessage::ShutDown) => {
-                  log::warn!("run_connector_v2: ShutDown received, scheduling 30s countdown");
-                  state.schedule_shutdown_prompt(30);
-                  state.push_event(
-                    EventLevel::Warning,
-                    "收到关机指令",
-                    "主控端请求 30 秒后关机，用户可以取消或立即执行。",
-                  );
+                Some(Ok(Message::Close(frame))) => {
+                  log::info!("run_connector_v2: WebSocket close frame received: {:?}", frame);
+                  break;
                 }
-                Err(error) => {
-                  log::warn!("run_connector_v2: failed to parse incoming message: {}", error);
-                  state.push_event(EventLevel::Warning, "入站消息解析失败", error);
+                Some(Ok(Message::Ping(_))) => {
+                  log::debug!("run_connector_v2: received ping (auto-pong handled by tungstenite)");
+                }
+                Some(Ok(Message::Pong(_))) => {
+                  log::debug!("run_connector_v2: received pong");
+                }
+                Some(Ok(Message::Frame(_))) => {
+                  log::debug!("run_connector_v2: received raw frame (low-level)");
+                }
+                Some(Err(error)) => {
+                  log::error!("run_connector_v2: WebSocket read error: {}", error);
+                  state.set_connection(ConnectionSnapshot {
+                    phase: ConnectionPhase::Error,
+                    connected: false,
+                    detail: "读取连接数据失败".into(),
+                    endpoint: connect_target.clone(),
+                    attempts,
+                    last_error: Some(error.to_string()),
+                    last_event_at: state.connection_snapshot().last_event_at,
+                  });
+                  state.push_event(EventLevel::Error, "主控连接流异常", error.to_string());
+                  break;
+                }
+                None => {
+                  log::info!("run_connector_v2: WebSocket stream ended");
+                  break;
                 }
               }
             }
-            Ok(Message::Binary(data)) => {
-              log::warn!("run_connector_v2: received unexpected binary frame, length={}", data.len());
-              state.push_event(EventLevel::Warning, "收到不支持的帧", "当前实现期望接收文本帧，但收到了二进制帧。");
-            }
-            Ok(Message::Close(frame)) => {
-              log::info!("run_connector_v2: WebSocket close frame received: {:?}", frame);
-              break;
-            }
-            Ok(Message::Ping(_)) => {
-              log::debug!("run_connector_v2: received ping (auto-pong handled by tungstenite)");
-            }
-            Ok(Message::Pong(_)) => {
-              log::debug!("run_connector_v2: received pong");
-            }
-            Ok(Message::Frame(_)) => {
-              log::debug!("run_connector_v2: received raw frame (low-level)");
-            }
-            Err(error) => {
-              log::error!("run_connector_v2: WebSocket read error: {}", error);
-              state.set_connection(ConnectionSnapshot {
-                phase: ConnectionPhase::Error,
-                connected: false,
-                detail: "读取连接数据失败".into(),
-                endpoint: connect_target.clone(),
-                attempts,
-                last_error: Some(error.to_string()),
-                last_event_at: state.connection_snapshot().last_event_at,
-              });
-              state.push_event(EventLevel::Error, "主控连接流异常", error.to_string());
-              break;
+            _ = ping_interval.tick() => {
+              if authenticated {
+                match write.send(Message::Ping(Vec::new().into())).await {
+                  Ok(()) => {
+                    log::debug!("run_connector_v2: heartbeat ping sent");
+                  }
+                  Err(error) => {
+                    log::error!("run_connector_v2: heartbeat ping failed: {}", error);
+                    state.set_connection(ConnectionSnapshot {
+                      phase: ConnectionPhase::Error,
+                      connected: false,
+                      detail: "连接心跳失败，准备重连".into(),
+                      endpoint: connect_target.clone(),
+                      attempts,
+                      last_error: Some(error.to_string()),
+                      last_event_at: state.connection_snapshot().last_event_at,
+                    });
+                    state.push_event(EventLevel::Error, "连接已断开", "心跳消息发送失败，检测到连接已中断。");
+                    break;
+                  }
+                }
+              }
             }
           }
 
